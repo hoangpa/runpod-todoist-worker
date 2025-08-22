@@ -4,7 +4,7 @@ import sys
 from huggingface_hub import login, snapshot_download
 from vllm import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.server.openai_api import OpenAIAPIHandler
+from vllm.entrypoints.openai.api_server import OpenAIAPIHandler
 import runpod
 
 print("--- Starting Worker ---")
