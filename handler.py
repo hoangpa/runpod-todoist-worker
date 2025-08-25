@@ -2,7 +2,7 @@
 import os
 import sys
 from huggingface_hub import login, snapshot_download
-from vllm import AsyncLLMEngine
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
@@ -38,25 +38,31 @@ MODEL_BASE_PATH = "/runpod-volume/models"
 print(f"Model repository: {MODEL_REPO}")
 print(f"Volume path: {MODEL_BASE_PATH}")
 
-# --- Step 3: Download Model if Necessary ---
-os.makedirs(MODEL_BASE_PATH, exist_ok=True)
-model_path = os.path.join(MODEL_BASE_PATH, MODEL_REPO.replace("/", "--"))
+CACHE_DIR = "/runpod-volume/model_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+print(f"Using model repository: {MODEL_REPO}")
+print(f"Using persistent cache directory: {CACHE_DIR}")
 
-if not os.path.exists(os.path.join(model_path, "config.json")):
-    print(f"Model not found at {model_path}. Starting download...")
-    try:
-        snapshot_download(repo_id=MODEL_REPO, local_dir=model_path, local_dir_use_symlinks=False)
-        print("Download complete.")
-    except Exception as e:
-        print(f"FATAL: Model download failed: {e}")
-        sys.exit(1)
-else:
-    print(f"Model already exists at {model_path}.")
+# --- Step 3: Download Model if Necessary ---
+# os.makedirs(MODEL_BASE_PATH, exist_ok=True)
+# model_path = os.path.join(MODEL_BASE_PATH, MODEL_REPO.replace("/", "--"))
+
+# if not os.path.exists(os.path.join(model_path, "config.json")):
+#     print(f"Model not found at {model_path}. Starting download...")
+#     try:
+#         snapshot_download(repo_id=MODEL_REPO, local_dir=model_path, local_dir_use_symlinks=False)
+#         print("Download complete.")
+#     except Exception as e:
+#         print(f"FATAL: Model download failed: {e}")
+#         sys.exit(1)
+# else:
+#     print(f"Model already exists at {model_path}.")
 
 # --- Step 4: Configure and Initialize vLLM ---
 print("Configuring vLLM engine...")
 engine_args = AsyncEngineArgs(
-    model=model_path,  # your local snapshot path
+    model=MODEL_REPO,  # your local snapshot path
+    download_dir=CACHE_DIR,
     tokenizer=os.environ.get("TOKENIZER_NAME", "Qwen/Qwen2.5-32B-Instruct"),
     dtype="auto",
     max_model_len=4096,
@@ -71,23 +77,47 @@ except Exception as e:
     print(f"FATAL: vLLM engine initialization failed: {e}")
     sys.exit(1)
 
-# --- Step 5: Set up API Handler ---
-print("Setting up OpenAI API handler...")
-api_handler = OpenAIAPIHandler(
-    engine,
-    engine_args.served_model_names or [engine_args.model],
-    "no-lora-module-path-needed",
-    None,
-)
-print("API handler is ready.")
+# --- Step 5: Set up OpenAI-compatible routes (no OpenAIAPIHandler) ---
+print("Setting up OpenAI-compatible routes...")
 
-# --- Step 6: Define RunPod Handler and Start Server ---
+# Present the friendly repo name to clients
+SERVED_MODEL = MODEL_REPO
+
+chat_server = OpenAIServingChat(
+    engine, served_model=SERVED_MODEL, response_role="assistant", chat_template=None
+)
+completion_server = OpenAIServingCompletion(engine, served_model=SERVED_MODEL)
+embedding_server = OpenAIServingEmbedding(engine, served_model=SERVED_MODEL)
+
 async def handler(job):
-    print("Received a job request.")
-    return await api_handler.handle_request(job['input'])
+    event = job.get("input", {}) if isinstance(job, dict) else {}
+    path = event.get("path", "")
+    body = event.get("body", {}) or {}
+
+    # sensible defaults
+    body.setdefault("model", SERVED_MODEL)
+    body.setdefault("stream", False)  # RunPod expects a single JSON response
+
+    try:
+        if path.endswith("/v1/chat/completions"):
+            req = ChatCompletionRequest(**body)
+            resp = await chat_server.create_chat_completion(req, raw_request=None)
+            return resp.model_dump()
+        elif path.endswith("/v1/completions"):
+            req = CompletionRequest(**body)
+            resp = await completion_server.create_completion(req, raw_request=None)
+            return resp.model_dump()
+        elif path.endswith("/v1/embeddings"):
+            req = EmbeddingRequest(**body)
+            resp = await embedding_server.create_embedding(req, raw_request=None)
+            return resp.model_dump()
+        else:
+            return {"error": f"Unknown path: {path}. Expected one of /v1/chat/completions, /v1/completions, /v1/embeddings"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 print("Starting RunPod serverless worker...")
 runpod.serverless.start({
     "handler": handler,
-    "concurrency_modifier": lambda x: 128,
+    "concurrency_modifier": lambda _: 128,
 })
