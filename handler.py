@@ -128,11 +128,11 @@ if is_lora_local:
         # OpenAI-serving also supports runtime loading, but preloading is simplest here
         lora_modules = [f"adapter={local_model_path}"]
 
-print(f"Configuring vLLM engine...
+print(f"""Configuring vLLM engine...
 model: {model_arg}
 tokenizer: {tokenizer_arg}
 TP: {TENSOR_PARALLEL}
-util: {GPU_UTIL}")
+util: {GPU_UTIL}""")
 
 engine_args = AsyncEngineArgs(
     model=model_arg,
