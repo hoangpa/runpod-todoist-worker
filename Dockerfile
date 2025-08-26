@@ -11,9 +11,10 @@ RUN apt-get update && \
 WORKDIR /app
 COPY requirements.txt .
 
-# Use CUDA 12.1 wheels for torch stack
-RUN pip install -r requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+# good: force PyTorch GPU wheels first, then everything else
+RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.3.1+cu121 torchvision==0.18.1+cu121 torchaudio==2.3.1+cu121 \
+    && pip install -r requirements.txt
 
 COPY handler.py .
 

@@ -1,7 +1,9 @@
 # handler.py — vLLM OpenAI-compatible RunPod worker (stable)
-# - Handles adapters cleanly: base via HF cache, adapter from snapshot path
-# - Avoids duplicate downloads by unifying cache/snapshot roots
-# - Compatible with newer and some older vLLM builds (LoRA kwargs are optional)
+# - Adapter or merged model: both supported
+# - Base via HF cache, adapter from snapshot path (no duplicate 60+ GB copy)
+# - Unifies cache/snapshot roots to your network volume
+# - Graceful fallback if vLLM doesn't support LoRA kwargs
+# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
 
 import os
 import runpod
@@ -14,7 +16,7 @@ except Exception:
     hf_login = None
     snapshot_download = None
 
-# vLLM imports
+# vLLM imports (OpenAI-serving entrypoints)
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.serving_engine import ModelConfig
@@ -29,21 +31,26 @@ print("=== RunPod vLLM worker boot (final) ===")
 # -----------------------------
 # 0) Volume + env
 # -----------------------------
-# Pick a sane volume root for both Serverless and Pods
+# Serverless typically mounts at /runpod-volume; debug pods often at /workspace
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT")
 if not VOLUME_ROOT:
     VOLUME_ROOT = "/runpod-volume" if os.path.ismount("/runpod-volume") else "/workspace"
 
-# Core env
+# Core env (accept either MODEL_REPO or MODEL_NAME just in case)
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-MODEL_REPO = os.environ.get("MODEL") or os.environ.get("MODEL_REPO") or os.environ.get("MODEL_ID") or "Qwen/Qwen2.5-32B-Instruct"
+MODEL_REPO = (
+    os.environ.get("MODEL_REPO")
+    or os.environ.get("MODEL")
+    or os.environ.get("MODEL_ID")
+    or os.environ.get("MODEL_NAME")  # legacy
+    or "Qwen/Qwen2.5-32B-Instruct"
+)
 BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")   # required if MODEL_REPO is an adapter
 SERVED_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_REPO)
 
 # Paths (avoid duplicates)
-CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))      # for snapshots/aux files
-HF_HOME = os.environ.get("HF_HOME", os.path.join(VOLUME_ROOT, "model_cache"))     # HF cache where base weights live
-
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))      # snapshots / small aux files
+HF_HOME   = os.environ.get("HF_HOME",   os.path.join(VOLUME_ROOT, "model_cache")) # HF cache where base weights live
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ.setdefault("HF_HOME", HF_HOME)
@@ -54,10 +61,10 @@ DTYPE = os.environ.get("DTYPE", "auto")
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "4096"))
 TENSOR_PARALLEL = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
 GPU_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
-TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "1").lower() in ("1","true","yes")
-ENFORCE_EAGER = os.environ.get("ENFORCE_EAGER", "0").lower() in ("1","true","yes")
+TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "1").lower() in ("1", "true", "yes")
+ENFORCE_EAGER = os.environ.get("ENFORCE_EAGER", "0").lower() in ("1", "true", "yes")
 
-# Tokenizer override (useful if MODEL_REPO is an adapter)
+# Tokenizer override (useful for adapters)
 TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")  # fallback set below
 
 # -----------------------------
@@ -111,10 +118,14 @@ is_lora_local = _looks_like_lora(local_model_path)
 # -----------------------------
 if is_lora_local:
     if not BASE_MODEL_NAME:
-        raise RuntimeError("Detected adapter files but BASE_MODEL_NAME is not set (e.g., Qwen/Qwen2.5-32B-Instruct).")
-    model_arg = BASE_MODEL_NAME            # BASE from repo/cache (lives under HF_HOME)
+        raise RuntimeError(
+            "Detected adapter files but BASE_MODEL_NAME is not set "
+            "(e.g., Qwen/Qwen2.5-32B-Instruct)."
+        )
+    # Base from repo/cache, adapter from local snapshot
+    model_arg = BASE_MODEL_NAME
     tokenizer_arg = TOKENIZER_NAME or BASE_MODEL_NAME
-    adapter_path = local_model_path        # adapter from snapshot path
+    adapter_path = local_model_path
     enable_lora = True
     lora_modules = [f"adapter={adapter_path}"]
 else:
@@ -124,7 +135,13 @@ else:
     enable_lora = False
     lora_modules = None
 
-print(f"Configuring vLLM engine...\n  model: {model_arg}\n  tokenizer: {tokenizer_arg}\n  TP: {TENSOR_PARALLEL}\n  util: {GPU_UTIL}")
+print(
+    "Configuring vLLM engine...\n"
+    f"  model: {model_arg}\n"
+    f"  tokenizer: {tokenizer_arg}\n"
+    f"  TP: {TENSOR_PARALLEL}\n"
+    f"  util: {GPU_UTIL}"
+)
 
 # Some vLLM builds don't support LoRA kwargs; try with, then fall back cleanly.
 try:
@@ -197,7 +214,12 @@ async def handler(job):
         elif path.endswith("/v1/models"):
             return {"object": "list", "data": [{"id": SERVED_NAME, "object": "model"}]}
         else:
-            return {"error": f"Unknown path: {path}. Expected one of /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models"}
+            return {
+                "error": (
+                    f"Unknown path: {path}. Expected one of "
+                    "/v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models"
+                )
+            }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
