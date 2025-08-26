@@ -1,5 +1,6 @@
 runpod
 vllm==0.5.4
+pyairports==2.1.1
 huggingface_hub>=0.23.0
 numpy<2
 pydantic>=2,<3
