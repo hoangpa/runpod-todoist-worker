@@ -22,9 +22,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.serving_engine import ModelConfig
 from vllm.entrypoints.openai.serving_models import (
     OpenAIServingModels,
-    BaseModelPath,
-    LoRAModulePath,
-    PromptAdapterPath,
+    BaseModelPath
 )
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
