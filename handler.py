@@ -1,49 +1,55 @@
-
-# handler_patched.py — vLLM (>=0.9) OpenAI-compatible RunPod worker
-# - Uses modern OpenAI-serving API (ModelConfig + OpenAIServingModels)
-# - Supports local HF snapshots and optional LoRA/adapter repos
-# - Routes /v1/chat/completions, /v1/completions, /v1/embeddings
+# handler.py — vLLM OpenAI-compatible RunPod worker (stable)
+# - Handles adapters cleanly: base via HF cache, adapter from snapshot path
+# - Avoids duplicate downloads by unifying cache/snapshot roots
+# - Compatible with newer and some older vLLM builds (LoRA kwargs are optional)
 
 import os
-import json
 import runpod
-from typing import Any, Dict, Optional
+from typing import Optional
 
-# HF auth + snapshot
+# Optional: huggingface_hub for login + snapshot
 try:
     from huggingface_hub import login as hf_login, snapshot_download
 except Exception:
     hf_login = None
     snapshot_download = None
 
-# vLLM imports (modern paths)
+# vLLM imports
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.serving_engine import ModelConfig
-from vllm.entrypoints.openai.serving_models import (
-    OpenAIServingModels,
-    BaseModelPath
-)
+from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    CompletionRequest,
-    EmbeddingRequest,
-)
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest, EmbeddingRequest
 
-print("=== RunPod vLLM worker boot ===")
+print("=== RunPod vLLM worker boot (final) ===")
 
 # -----------------------------
-# 0) Env & defaults
+# 0) Volume + env
 # -----------------------------
+# Pick a sane volume root for both Serverless and Pods
+VOLUME_ROOT = os.environ.get("VOLUME_ROOT")
+if not VOLUME_ROOT:
+    VOLUME_ROOT = "/runpod-volume" if os.path.ismount("/runpod-volume") else "/workspace"
+
+# Core env
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-MODEL_REPO = os.environ.get("MODEL") or os.environ.get("MODEL_REPO") or os.environ.get("MODEL_ID") or "Qwen/Qwen2.5-7B-Instruct"
-BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")  # required if MODEL_REPO is a LoRA/adapter
-CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/models")
-SERVED_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_REPO)  # what clients use as `model`
+MODEL_REPO = os.environ.get("MODEL") or os.environ.get("MODEL_REPO") or os.environ.get("MODEL_ID") or "Qwen/Qwen2.5-32B-Instruct"
+BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")   # required if MODEL_REPO is an adapter
+SERVED_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_REPO)
 
+# Paths (avoid duplicates)
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))      # for snapshots/aux files
+HF_HOME = os.environ.get("HF_HOME", os.path.join(VOLUME_ROOT, "model_cache"))     # HF cache where base weights live
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(HF_HOME, exist_ok=True)
+os.environ.setdefault("HF_HOME", HF_HOME)
+os.environ.setdefault("TRANSFORMERS_CACHE", HF_HOME)
+
+# Engine knobs
 DTYPE = os.environ.get("DTYPE", "auto")
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "4096"))
 TENSOR_PARALLEL = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
@@ -51,11 +57,11 @@ GPU_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "1").lower() in ("1","true","yes")
 ENFORCE_EAGER = os.environ.get("ENFORCE_EAGER", "0").lower() in ("1","true","yes")
 
-# Allow specifying an explicit tokenizer (useful when MODEL_REPO is an adapter snapshot)
-TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")  # fallback later to model/base
+# Tokenizer override (useful if MODEL_REPO is an adapter)
+TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")  # fallback set below
 
 # -----------------------------
-# 1) HF login (optional) & snapshot
+# 1) HF login (optional) + snapshot MODEL_REPO
 # -----------------------------
 local_model_path: Optional[str] = None
 if HF_TOKEN and hf_login is not None:
@@ -68,83 +74,85 @@ if HF_TOKEN and hf_login is not None:
 
 if snapshot_download is not None:
     try:
-        print(f"Preparing snapshot for repo: {MODEL_REPO}")
-        # Keep a flat path under CACHE_DIR for cleanliness
         local_model_path = os.path.join(CACHE_DIR, MODEL_REPO.replace("/", "--"))
         if not os.path.exists(os.path.join(local_model_path, "config.json")):
+            print(f"Snapshotting {MODEL_REPO} -> {local_model_path}")
             os.makedirs(local_model_path, exist_ok=True)
             snapshot_download(
                 repo_id=MODEL_REPO,
                 local_dir=local_model_path,
                 local_dir_use_symlinks=False,
                 token=HF_TOKEN,
-                allow_patterns=None,
-                ignore_patterns=None,
                 resume_download=True,
             )
-            print(f"Snapshot ready at: {local_model_path}")
         else:
-            print(f"Model already present at: {local_model_path}")
+            print(f"Snapshot already present: {local_model_path}")
     except Exception as e:
-        print(f"Snapshot warning: {e}. Will let vLLM fetch remotely.")
+        print(f"Snapshot warning: {e}. Will let vLLM fetch {MODEL_REPO} via HF cache.")
         local_model_path = None
 else:
-    print("huggingface_hub not available; will let vLLM fetch the model directly.")
+    print("huggingface_hub not available; will let vLLM fetch directly.")
 
 # -----------------------------
-# 2) Detect if MODEL_REPO looks like a LoRA/adapter folder (local) 
+# 2) Adapter detection (is MODEL_REPO a LoRA-style adapter?)
 # -----------------------------
-def _looks_like_lora(path: str) -> bool:
+def _looks_like_lora(path: Optional[str]) -> bool:
     if not path:
         return False
-    return any(os.path.exists(os.path.join(path, fname)) for fname in ("adapter_config.json","adapter_model.safetensors","lora.safetensors"))
+    for fname in ("adapter_config.json", "adapter_model.safetensors", "lora.safetensors"):
+        if os.path.exists(os.path.join(path, fname)):
+            return True
+    return False
 
-is_lora_local = _looks_like_lora(local_model_path or "")
+is_lora_local = _looks_like_lora(local_model_path)
 
 # -----------------------------
-# 3) Build engine args
+# 3) Build engine args (correct base vs adapter wiring)
 # -----------------------------
-# Choose model path: prefer local snapshot if available; otherwise use repo id
-model_arg = local_model_path if local_model_path else MODEL_REPO
-
-# Decide tokenizer default
-if TOKENIZER_NAME:
-    tokenizer_arg = TOKENIZER_NAME
-else:
-    # If adapter, prefer base model tokenizer; else use same as model
-    tokenizer_arg = BASE_MODEL_NAME if (is_lora_local and BASE_MODEL_NAME) else model_arg
-
-# LoRA preloading setup
-enable_lora = False
-lora_modules = None
 if is_lora_local:
     if not BASE_MODEL_NAME:
-        print("WARNING: Detected adapter files but BASE_MODEL_NAME is not set. "
-            "Set BASE_MODEL_NAME to the base HF repo (e.g., Qwen/Qwen2.5-32B-Instruct).")
-    else:
-        enable_lora = True
-        # OpenAI-serving also supports runtime loading, but preloading is simplest here
-        lora_modules = [f"adapter={local_model_path}"]
+        raise RuntimeError("Detected adapter files but BASE_MODEL_NAME is not set (e.g., Qwen/Qwen2.5-32B-Instruct).")
+    model_arg = BASE_MODEL_NAME            # BASE from repo/cache (lives under HF_HOME)
+    tokenizer_arg = TOKENIZER_NAME or BASE_MODEL_NAME
+    adapter_path = local_model_path        # adapter from snapshot path
+    enable_lora = True
+    lora_modules = [f"adapter={adapter_path}"]
+else:
+    # Non-adapter: serve MODEL_REPO itself (prefer local snapshot if present)
+    model_arg = local_model_path or MODEL_REPO
+    tokenizer_arg = TOKENIZER_NAME or model_arg
+    enable_lora = False
+    lora_modules = None
 
-print(f"""Configuring vLLM engine...
-model: {model_arg}
-tokenizer: {tokenizer_arg}
-TP: {TENSOR_PARALLEL}
-util: {GPU_UTIL}""")
+print(f"Configuring vLLM engine...\n  model: {model_arg}\n  tokenizer: {tokenizer_arg}\n  TP: {TENSOR_PARALLEL}\n  util: {GPU_UTIL}")
 
-engine_args = AsyncEngineArgs(
-    model=model_arg,
-    tokenizer=tokenizer_arg,
-    dtype=DTYPE,
-    max_model_len=MAX_MODEL_LEN,
-    tensor_parallel_size=TENSOR_PARALLEL,
-    gpu_memory_utilization=GPU_UTIL,
-    trust_remote_code=TRUST_REMOTE_CODE,
-    enforce_eager=ENFORCE_EAGER,
-    enable_lora=enable_lora,
-    lora_modules=lora_modules,
-    download_dir=CACHE_DIR,
-)
+# Some vLLM builds don't support LoRA kwargs; try with, then fall back cleanly.
+try:
+    engine_args = AsyncEngineArgs(
+        model=model_arg,
+        tokenizer=tokenizer_arg,
+        dtype=DTYPE,
+        max_model_len=MAX_MODEL_LEN,
+        tensor_parallel_size=TENSOR_PARALLEL,
+        gpu_memory_utilization=GPU_UTIL,
+        trust_remote_code=TRUST_REMOTE_CODE,
+        enforce_eager=ENFORCE_EAGER,
+        download_dir=CACHE_DIR,
+        **({"enable_lora": True, "lora_modules": lora_modules} if enable_lora else {}),
+    )
+except TypeError as e:
+    print(f"LoRA args unsupported on this vLLM: {e}. Falling back without LoRA kwargs.")
+    engine_args = AsyncEngineArgs(
+        model=model_arg,
+        tokenizer=tokenizer_arg,
+        dtype=DTYPE,
+        max_model_len=MAX_MODEL_LEN,
+        tensor_parallel_size=TENSOR_PARALLEL,
+        gpu_memory_utilization=GPU_UTIL,
+        trust_remote_code=TRUST_REMOTE_CODE,
+        enforce_eager=ENFORCE_EAGER,
+        download_dir=CACHE_DIR,
+    )
 
 engine = AsyncLLMEngine.from_engine_args(engine_args)
 
@@ -154,16 +162,8 @@ engine = AsyncLLMEngine.from_engine_args(engine_args)
 models = OpenAIServingModels(
     engine_client=engine,
     base_model_paths=[BaseModelPath(name=SERVED_NAME)],
-    # You can also add LoRA or prompt adapters here if you want runtime routes
-    # lora_module_paths=[LoRAModulePath(name="adapter", path=local_model_path)] if is_lora_local else None,
-    # prompt_adapter_paths=[PromptAdapterPath(name="...", path="...")],
 )
-
-model_config = ModelConfig(
-    response_role="assistant",
-    chat_template=None,
-)
-
+model_config = ModelConfig(response_role="assistant", chat_template=None)
 chat_server = OpenAIServingChat(engine, model_config, models)
 completion_server = OpenAIServingCompletion(engine, model_config, models)
 embedding_server = OpenAIServingEmbedding(engine, model_config, models)
@@ -177,10 +177,8 @@ async def handler(job):
         path = event.get("path", "")
         body = event.get("body", {}) or {}
 
-        # Defaults
-        body = dict(body)  # shallow copy
+        body = dict(body)
         body.setdefault("model", SERVED_NAME)
-        # RunPod likes a single JSON response; we keep stream False by default
         if path.endswith("/v1/chat/completions") or path.endswith("/v1/completions"):
             body.setdefault("stream", False)
 
@@ -197,16 +195,13 @@ async def handler(job):
             resp = await embedding_server.create_embedding(req, raw_request=None)
             return resp.model_dump()
         elif path.endswith("/v1/models"):
-            # Optional: expose models list (handled by OpenAIServingModels)
-            # The ServingModels object provides a starlette route typically;
-            # here we return a minimal static response matching OpenAI format.
             return {"object": "list", "data": [{"id": SERVED_NAME, "object": "model"}]}
         else:
             return {"error": f"Unknown path: {path}. Expected one of /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
-print("Starting RunPod serverless worker...")
+print("Starting RunPod serverless worker (final)...")
 runpod.serverless.start({
     "handler": handler,
     "concurrency_modifier": lambda _: 128,
