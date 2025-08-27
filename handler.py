@@ -1,35 +1,25 @@
-# handler.py — vLLM OpenAI-compatible RunPod worker (v0.7.x)
-# - Supports adapter (LoRA) or merged model
-# - Detects adapter at repo root OR in a nested subfolder (e.g., epoch_4/)
-# - Unifies HF cache paths to avoid duplicate downloads
-# - Graceful fallback if LoRA kwargs are unsupported
-# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (update - #2)
+# handler.py — vLLM OpenAI-compatible RunPod worker (robust snapshot check)
+# - Serves merged model by default; supports adapter (LoRA) if BASE_MODEL_NAME is set
+# - Only skips HF snapshot if *all* required shards (or an index) are present
+# - Detects adapters at repo root or nested (e.g., epoch_4/)
+# - Unifies HF caches to one path to avoid duplicate downloads
+# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
 
 import os
-import runpod
-from typing import Optional
+import json
 import glob
-# Optional: huggingface_hub for login + snapshot
+from typing import Optional
 
-def _has_weights(path: Optional[str]) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    # explicit index files
-    for idx in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        if os.path.exists(os.path.join(path, idx)):
-            return True
-    # or any shard files
-    if glob.glob(os.path.join(path, "*.safetensors")) or glob.glob(os.path.join(path, "*.bin")):
-        return True
-    return False
+import runpod
 
+# Optional Hugging Face hub (prefer installed; otherwise we let vLLM fetch)
 try:
     from huggingface_hub import login as hf_login, snapshot_download
 except Exception:
     hf_login = None
     snapshot_download = None
 
-# vLLM imports (OpenAI-serving entrypoints) — compatible with vLLM 0.7.x
+# vLLM (tested with vLLM 0.7.x)
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.serving_engine import ModelConfig
@@ -43,7 +33,7 @@ from vllm.entrypoints.openai.protocol import (
     EmbeddingRequest,
 )
 
-print("=== RunPod vLLM worker boot (adapter-aware, nested) ===")
+print("=== RunPod vLLM worker boot (robust snapshot + adapter-aware) ===")
 
 # -----------------------------
 # 0) Volume + env
@@ -52,7 +42,6 @@ VOLUME_ROOT = os.environ.get("VOLUME_ROOT")
 if not VOLUME_ROOT:
     VOLUME_ROOT = "/runpod-volume" if os.path.ismount("/runpod-volume") else "/workspace"
 
-# Core env (accept either MODEL_REPO or MODEL_NAME just in case)
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 MODEL_REPO = (
     os.environ.get("MODEL_REPO")
@@ -61,17 +50,17 @@ MODEL_REPO = (
     or os.environ.get("MODEL_NAME")
     or "Qwen/Qwen2.5-32B-Instruct"
 )
-BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")   # required if MODEL_REPO is an adapter
+BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")  # set only for adapter mode
 SERVED_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_REPO)
 
 # Paths (avoid duplicates)
-CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))      # snapshots / small aux files
-HF_HOME   = os.environ.get("HF_HOME",   os.path.join(VOLUME_ROOT, "model_cache")) # HF cache where base weights live
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_DIR, ".hf_cache"))
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))
+HF_HOME = os.environ.get("HF_HOME", os.path.join(VOLUME_ROOT, "models"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ.setdefault("HF_HOME", HF_HOME)
 os.environ.setdefault("TRANSFORMERS_CACHE", HF_HOME)
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_DIR, ".hf_cache"))
 
 # Engine knobs
 DTYPE = os.environ.get("DTYPE", "auto")
@@ -81,14 +70,54 @@ GPU_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "1").lower() in ("1", "true", "yes")
 ENFORCE_EAGER = os.environ.get("ENFORCE_EAGER", "0").lower() in ("1", "true", "yes")
 
-# Tokenizer override (useful for adapters)
-TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")  # fallback set below
+# Tokenizer override (good safety for merged snapshots missing tokenizer files)
+TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")
 
-# Optional: let user hint a subfolder (e.g., "epoch_4")
+# Optional: hint for nested adapter dir (e.g., "epoch_4")
 ADAPTER_SUBDIR = os.environ.get("ADAPTER_SUBDIR")
 
+# Heuristic (used only if no index file is present)
+FALLBACK_SHARD_MIN = int(os.environ.get("FALLBACK_SHARD_MIN", "14"))  # ~Qwen 32B shards
+
 # -----------------------------
-# 1) HF login (optional) + snapshot MODEL_REPO
+# Helper: verify snapshot completeness
+# -----------------------------
+def snapshot_complete(path: Optional[str]) -> bool:
+    """
+    A snapshot is considered complete if:
+    - model.safetensors.index.json exists AND every file listed in weight_map is present, OR
+    - (fallback) we find at least FALLBACK_SHARD_MIN shard files like model-*-of-*.safetensors
+      (used when index isn't published yet, but it's still a multi-file shard layout).
+    """
+    if not path or not os.path.isdir(path):
+        return False
+
+    idx = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        try:
+            with open(idx, "r") as f:
+                data = json.load(f)
+            needed = set(data.get("weight_map", {}).values())
+            missing = [p for p in needed if not os.path.exists(os.path.join(path, p))]
+            if missing:
+                print(f"Snapshot index found but missing {len(missing)} files (e.g., {missing[:3]})")
+                return False
+            return True
+        except Exception as e:
+            print(f"Index check failed: {e}. Falling back to shard-count heuristic.")
+
+    shards = glob.glob(os.path.join(path, "model-*-of-*.safetensors"))
+    if len(shards) >= FALLBACK_SHARD_MIN:
+        return True
+
+    # Also accept monolithic weight files if present (rare for 32B, but safe)
+    if glob.glob(os.path.join(path, "model.safetensors")) or glob.glob(os.path.join(path, "pytorch_model*.bin")):
+        return True
+
+    return False
+
+# -----------------------------
+# 1) HF login (optional) + snapshot hydrate
 # -----------------------------
 local_model_path: Optional[str] = None
 if HF_TOKEN and hf_login is not None:
@@ -99,11 +128,12 @@ if HF_TOKEN and hf_login is not None:
     except Exception as e:
         print(f"HF login warning: {e}")
 
+# Materialize local snapshot if needed
 if snapshot_download is not None:
     try:
         local_model_path = os.path.join(CACHE_DIR, MODEL_REPO.replace("/", "--"))
-        if not _has_weights(local_model_path):
-            print(f"Snapshot missing weights. Hydrating {MODEL_REPO} -> {local_model_path}")
+        if not snapshot_complete(local_model_path):
+            print(f"Hydrating (resume) {MODEL_REPO} -> {local_model_path}")
             os.makedirs(local_model_path, exist_ok=True)
             snapshot_download(
                 repo_id=MODEL_REPO,
@@ -111,9 +141,17 @@ if snapshot_download is not None:
                 local_dir_use_symlinks=False,
                 token=HF_TOKEN,
                 resume_download=True,
+                # Only grab what's needed to serve
+                allow_patterns=[
+                    "*.safetensors", "*.bin", "*index.json",
+                    "tokenizer*", "*merges.txt", "*vocab*.json",
+                    "config.json", "generation_config.json",
+                    "added_tokens.json", "chat_template.jinja",
+                    "*.model", "*.tiktoken", "*.spm"
+                ],
             )
         else:
-            print(f"Snapshot with weights present: {local_model_path}")
+            print(f"Snapshot complete: {local_model_path}")
     except Exception as e:
         print(f"Snapshot warning: {e}. Will let vLLM fetch {MODEL_REPO} via HF cache.")
         local_model_path = None
@@ -123,27 +161,25 @@ else:
 # -----------------------------
 # 2) Adapter detection (root or nested)
 # -----------------------------
-def _find_lora_root(path: Optional[str]) -> Optional[str]:
-    """Return the directory that contains adapter_config.json and adapter weights.
-       Works for repo root or nested layouts (e.g., epoch_4/)."""
+def find_lora_root(path: Optional[str]) -> Optional[str]:
+    """Locate adapter_config.json + adapter weights at root or nested (epoch_*)."""
     if not path:
         return None
-
     wanted = {"adapter_config.json", "adapter_model.safetensors", "lora.safetensors"}
 
-    # User hint takes priority
+    # explicit hint first
     if ADAPTER_SUBDIR:
         candidate = os.path.join(path, ADAPTER_SUBDIR)
         if any(os.path.exists(os.path.join(candidate, f)) for f in wanted):
             print(f"Adapter found via ADAPTER_SUBDIR at: {candidate}")
             return candidate
 
-    # Quick check at root
+    # root check
     if any(os.path.exists(os.path.join(path, f)) for f in wanted):
         print(f"Adapter found at repo root: {path}")
         return path
 
-    # Fallback: walk subdirs to find a matching folder
+    # nested walk
     for root, _, files in os.walk(path):
         files_set = set(files)
         if ("adapter_config.json" in files_set) and (
@@ -154,11 +190,11 @@ def _find_lora_root(path: Optional[str]) -> Optional[str]:
 
     return None
 
-adapter_root = _find_lora_root(local_model_path)
+adapter_root = find_lora_root(local_model_path)
 is_lora_local = adapter_root is not None
 
 # -----------------------------
-# 3) Build engine args (correct base vs adapter wiring)
+# 3) Build engine args (adapter vs merged)
 # -----------------------------
 if is_lora_local:
     if not BASE_MODEL_NAME:
@@ -172,15 +208,15 @@ if is_lora_local:
     lora_modules = [f"adapter={adapter_root}"]
     print(f"Serving BASE: {model_arg} with LoRA adapter at: {adapter_root}")
 else:
-    # Optional hardening: if BASE_MODEL_NAME is set, try serving base+adapter by repo id
     if BASE_MODEL_NAME:
+        # Allow serving base + adapter by HF repo id even if local adapter files aren't present
         print("No local adapter files found; enabling LoRA via HF repo id.")
         model_arg = BASE_MODEL_NAME
         tokenizer_arg = TOKENIZER_NAME or BASE_MODEL_NAME
         enable_lora = True
-        lora_modules = [f"adapter={MODEL_REPO}"]  # vLLM will resolve HF repo id
+        lora_modules = [f"adapter={MODEL_REPO}"]
     else:
-        # Non-adapter: serve MODEL_REPO itself (prefer local snapshot if present)
+        # Merged/standalone
         model_arg = local_model_path or MODEL_REPO
         tokenizer_arg = TOKENIZER_NAME or model_arg
         enable_lora = False
@@ -195,7 +231,7 @@ print(
     f"  util: {GPU_UTIL}"
 )
 
-# Some vLLM builds don't support LoRA kwargs; try with, then fall back cleanly.
+# Try LoRA kwargs; if unsupported, fall back cleanly
 try:
     engine_args = AsyncEngineArgs(
         model=model_arg,
@@ -226,7 +262,7 @@ except TypeError as e:
 engine = AsyncLLMEngine.from_engine_args(engine_args)
 
 # -----------------------------
-# 4) OpenAI-serving objects (modern API)
+# 4) OpenAI-serving objects
 # -----------------------------
 models = OpenAIServingModels(
     engine_client=engine,
@@ -278,5 +314,6 @@ async def handler(job):
 print("Starting RunPod serverless worker...")
 runpod.serverless.start({
     "handler": handler,
-    "concurrency_modifier": lambda _: 128,
+    # 32B is heavy—start conservatively; tune up later
+    "concurrency_modifier": lambda _: 16,
 })
