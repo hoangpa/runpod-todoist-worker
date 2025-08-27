@@ -3,7 +3,7 @@
 # - Detects adapter at repo root OR in a nested subfolder (e.g., epoch_4/)
 # - Unifies HF cache paths to avoid duplicate downloads
 # - Graceful fallback if LoRA kwargs are unsupported
-# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (update)
+# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (update - #2)
 
 import os
 import runpod
@@ -54,6 +54,7 @@ SERVED_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL_REPO)
 # Paths (avoid duplicates)
 CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(VOLUME_ROOT, "models"))      # snapshots / small aux files
 HF_HOME   = os.environ.get("HF_HOME",   os.path.join(VOLUME_ROOT, "model_cache")) # HF cache where base weights live
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(CACHE_DIR, ".hf_cache"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(HF_HOME, exist_ok=True)
 os.environ.setdefault("HF_HOME", HF_HOME)
