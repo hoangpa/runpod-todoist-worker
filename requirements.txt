@@ -1,6 +1,6 @@
 runpod
 vllm==0.5.4
-pyairports==2.1.1
+pyairports @ https://files.pythonhosted.org/packages/6e/75/b424aebc9f2fc5db319d5df5fff62fa19254c8ef974c254588d48c480df2/pyairports-2.1.1-py3-none-any.whl
 huggingface_hub>=0.23.0
 numpy<2
 pydantic>=2,<3
