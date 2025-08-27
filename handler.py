@@ -1,8 +1,8 @@
-# handler.py — vLLM OpenAI-compatible RunPod worker (stable)
-# - Adapter or merged model: both supported
-# - Base via HF cache, adapter from snapshot path (no duplicate 60+ GB copy)
-# - Unifies cache/snapshot roots to your network volume
-# - Graceful fallback if vLLM doesn't support LoRA kwargs
+# handler.py — vLLM OpenAI-compatible RunPod worker (v0.7.x)
+# - Supports adapter (LoRA) or merged model
+# - Detects adapter at repo root OR in a nested subfolder (e.g., epoch_4/)
+# - Unifies HF cache paths to avoid duplicate downloads
+# - Graceful fallback if LoRA kwargs are unsupported
 # - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
 
 import os
@@ -16,7 +16,7 @@ except Exception:
     hf_login = None
     snapshot_download = None
 
-# vLLM imports (OpenAI-serving entrypoints)
+# vLLM imports (OpenAI-serving entrypoints) — compatible with vLLM 0.7.x
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.serving_engine import ModelConfig
@@ -24,14 +24,17 @@ from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseMode
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest, EmbeddingRequest
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+)
 
-print("=== RunPod vLLM worker boot (final) ===")
+print("=== RunPod vLLM worker boot (adapter-aware, nested) ===")
 
 # -----------------------------
 # 0) Volume + env
 # -----------------------------
-# Serverless typically mounts at /runpod-volume; debug pods often at /workspace
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT")
 if not VOLUME_ROOT:
     VOLUME_ROOT = "/runpod-volume" if os.path.ismount("/runpod-volume") else "/workspace"
@@ -42,7 +45,7 @@ MODEL_REPO = (
     os.environ.get("MODEL_REPO")
     or os.environ.get("MODEL")
     or os.environ.get("MODEL_ID")
-    or os.environ.get("MODEL_NAME")  # legacy
+    or os.environ.get("MODEL_NAME")
     or "Qwen/Qwen2.5-32B-Instruct"
 )
 BASE_MODEL_NAME = os.environ.get("BASE_MODEL_NAME")   # required if MODEL_REPO is an adapter
@@ -67,6 +70,9 @@ ENFORCE_EAGER = os.environ.get("ENFORCE_EAGER", "0").lower() in ("1", "true", "y
 # Tokenizer override (useful for adapters)
 TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME")  # fallback set below
 
+# Optional: let user hint a subfolder (e.g., "epoch_4")
+ADAPTER_SUBDIR = os.environ.get("ADAPTER_SUBDIR")
+
 # -----------------------------
 # 1) HF login (optional) + snapshot MODEL_REPO
 # -----------------------------
@@ -82,7 +88,8 @@ if HF_TOKEN and hf_login is not None:
 if snapshot_download is not None:
     try:
         local_model_path = os.path.join(CACHE_DIR, MODEL_REPO.replace("/", "--"))
-        if not os.path.exists(os.path.join(local_model_path, "config.json")):
+        if not os.path.exists(os.path.join(local_model_path, "config.json")) and \
+           not os.path.exists(os.path.join(local_model_path, "adapter_config.json")):
             print(f"Snapshotting {MODEL_REPO} -> {local_model_path}")
             os.makedirs(local_model_path, exist_ok=True)
             snapshot_download(
@@ -101,17 +108,41 @@ else:
     print("huggingface_hub not available; will let vLLM fetch directly.")
 
 # -----------------------------
-# 2) Adapter detection (is MODEL_REPO a LoRA-style adapter?)
+# 2) Adapter detection (root or nested)
 # -----------------------------
-def _looks_like_lora(path: Optional[str]) -> bool:
+def _find_lora_root(path: Optional[str]) -> Optional[str]:
+    """Return the directory that contains adapter_config.json and adapter weights.
+       Works for repo root or nested layouts (e.g., epoch_4/)."""
     if not path:
-        return False
-    for fname in ("adapter_config.json", "adapter_model.safetensors", "lora.safetensors"):
-        if os.path.exists(os.path.join(path, fname)):
-            return True
-    return False
+        return None
 
-is_lora_local = _looks_like_lora(local_model_path)
+    wanted = {"adapter_config.json", "adapter_model.safetensors", "lora.safetensors"}
+
+    # User hint takes priority
+    if ADAPTER_SUBDIR:
+        candidate = os.path.join(path, ADAPTER_SUBDIR)
+        if any(os.path.exists(os.path.join(candidate, f)) for f in wanted):
+            print(f"Adapter found via ADAPTER_SUBDIR at: {candidate}")
+            return candidate
+
+    # Quick check at root
+    if any(os.path.exists(os.path.join(path, f)) for f in wanted):
+        print(f"Adapter found at repo root: {path}")
+        return path
+
+    # Fallback: walk subdirs to find a matching folder
+    for root, _, files in os.walk(path):
+        files_set = set(files)
+        if ("adapter_config.json" in files_set) and (
+            "adapter_model.safetensors" in files_set or "lora.safetensors" in files_set
+        ):
+            print(f"Adapter found nested at: {root}")
+            return root
+
+    return None
+
+adapter_root = _find_lora_root(local_model_path)
+is_lora_local = adapter_root is not None
 
 # -----------------------------
 # 3) Build engine args (correct base vs adapter wiring)
@@ -122,18 +153,26 @@ if is_lora_local:
             "Detected adapter files but BASE_MODEL_NAME is not set "
             "(e.g., Qwen/Qwen2.5-32B-Instruct)."
         )
-    # Base from repo/cache, adapter from local snapshot
     model_arg = BASE_MODEL_NAME
     tokenizer_arg = TOKENIZER_NAME or BASE_MODEL_NAME
-    adapter_path = local_model_path
     enable_lora = True
-    lora_modules = [f"adapter={adapter_path}"]
+    lora_modules = [f"adapter={adapter_root}"]
+    print(f"Serving BASE: {model_arg} with LoRA adapter at: {adapter_root}")
 else:
-    # Non-adapter: serve MODEL_REPO itself (prefer local snapshot if present)
-    model_arg = local_model_path or MODEL_REPO
-    tokenizer_arg = TOKENIZER_NAME or model_arg
-    enable_lora = False
-    lora_modules = None
+    # Optional hardening: if BASE_MODEL_NAME is set, try serving base+adapter by repo id
+    if BASE_MODEL_NAME:
+        print("No local adapter files found; enabling LoRA via HF repo id.")
+        model_arg = BASE_MODEL_NAME
+        tokenizer_arg = TOKENIZER_NAME or BASE_MODEL_NAME
+        enable_lora = True
+        lora_modules = [f"adapter={MODEL_REPO}"]  # vLLM will resolve HF repo id
+    else:
+        # Non-adapter: serve MODEL_REPO itself (prefer local snapshot if present)
+        model_arg = local_model_path or MODEL_REPO
+        tokenizer_arg = TOKENIZER_NAME or model_arg
+        enable_lora = False
+        lora_modules = None
+        print(f"Serving standalone model: {model_arg}")
 
 print(
     "Configuring vLLM engine...\n"
@@ -223,7 +262,7 @@ async def handler(job):
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
-print("Starting RunPod serverless worker (final)...")
+print("Starting RunPod serverless worker...")
 runpod.serverless.start({
     "handler": handler,
     "concurrency_modifier": lambda _: 128,
