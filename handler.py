@@ -3,7 +3,7 @@
 # - Detects adapter at repo root OR in a nested subfolder (e.g., epoch_4/)
 # - Unifies HF cache paths to avoid duplicate downloads
 # - Graceful fallback if LoRA kwargs are unsupported
-# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
+# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (update)
 
 import os
 import runpod
