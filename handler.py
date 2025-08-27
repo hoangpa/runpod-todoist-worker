@@ -266,7 +266,7 @@ engine = AsyncLLMEngine.from_engine_args(engine_args)
 # -----------------------------
 models = OpenAIServingModels(
     engine_client=engine,
-    base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)],
+    base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)]
 )
 model_config = ModelConfig(response_role="assistant", chat_template=None)
 chat_server = OpenAIServingChat(engine, model_config, models)
