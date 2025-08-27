@@ -264,11 +264,12 @@ engine = AsyncLLMEngine.from_engine_args(engine_args)
 # -----------------------------
 # 4) OpenAI-serving objects
 # -----------------------------
+model_config = ModelConfig(response_role="assistant", chat_template=None)
 models = OpenAIServingModels(
     engine_client=engine,
-    base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)]
+    model_config=model_config,  # <- REQUIRED in 0.7.x
+    base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)],  # <- include model_path
 )
-model_config = ModelConfig(response_role="assistant", chat_template=None)
 chat_server = OpenAIServingChat(engine, model_config, models)
 completion_server = OpenAIServingCompletion(engine, model_config, models)
 embedding_server = OpenAIServingEmbedding(engine, model_config, models)
