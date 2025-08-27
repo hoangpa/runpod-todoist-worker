@@ -8,8 +8,21 @@
 import os
 import runpod
 from typing import Optional
-
+import glob
 # Optional: huggingface_hub for login + snapshot
+
+def _has_weights(path: Optional[str]) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    # explicit index files
+    for idx in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        if os.path.exists(os.path.join(path, idx)):
+            return True
+    # or any shard files
+    if glob.glob(os.path.join(path, "*.safetensors")) or glob.glob(os.path.join(path, "*.bin")):
+        return True
+    return False
+
 try:
     from huggingface_hub import login as hf_login, snapshot_download
 except Exception:
@@ -89,9 +102,8 @@ if HF_TOKEN and hf_login is not None:
 if snapshot_download is not None:
     try:
         local_model_path = os.path.join(CACHE_DIR, MODEL_REPO.replace("/", "--"))
-        if not os.path.exists(os.path.join(local_model_path, "config.json")) and \
-           not os.path.exists(os.path.join(local_model_path, "adapter_config.json")):
-            print(f"Snapshotting {MODEL_REPO} -> {local_model_path}")
+        if not _has_weights(local_model_path):
+            print(f"Snapshot missing weights. Hydrating {MODEL_REPO} -> {local_model_path}")
             os.makedirs(local_model_path, exist_ok=True)
             snapshot_download(
                 repo_id=MODEL_REPO,
@@ -101,7 +113,7 @@ if snapshot_download is not None:
                 resume_download=True,
             )
         else:
-            print(f"Snapshot already present: {local_model_path}")
+            print(f"Snapshot with weights present: {local_model_path}")
     except Exception as e:
         print(f"Snapshot warning: {e}. Will let vLLM fetch {MODEL_REPO} via HF cache.")
         local_model_path = None
