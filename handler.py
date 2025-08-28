@@ -3,7 +3,7 @@
 # - Only skips HF snapshot if *all* required shards (or an index) are present
 # - Detects adapters at repo root or nested (e.g., epoch_4/)
 # - Unifies HF caches to one path to avoid duplicate downloads
-# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models
+# - Exposes /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (ugh)
 
 import os
 import json
