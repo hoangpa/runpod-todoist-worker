@@ -282,16 +282,22 @@ models = OpenAIServingModels(
     model_config=model_config,  # <- REQUIRED in 0.7.x
     base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)],  # <- include model_path
 )
+# Reuse common defaults
+CHAT_TEMPLATE = None                  # let tokenizer's template be used (Qwen has one)
+CHAT_TEMPLATE_FORMAT = "auto"         # valid: auto | string | openai
+
+# Chat requires response_role + kw-onlys
 chat_server = OpenAIServingChat(
     engine_client=engine,
     model_config=model_config,
     models=models,
-    response_role="assistant",             # REQUIRED in 0.7.x
-    request_logger=None,                   # REQUIRED keyword-only; pass None
-    chat_template=None,                    # let tokenizer’s template resolve
-    chat_template_content_format="auto",   # keyword-only; safe default
+    response_role="assistant",
+    request_logger=None,
+    chat_template=CHAT_TEMPLATE,
+    chat_template_content_format=CHAT_TEMPLATE_FORMAT,
 )
-# Completion: add request_logger kw-only
+
+# Completion requires request_logger (kw-only)
 completion_server = OpenAIServingCompletion(
     engine_client=engine,
     model_config=model_config,
@@ -299,12 +305,14 @@ completion_server = OpenAIServingCompletion(
     request_logger=None,
 )
 
-# Embedding: add request_logger kw-only
+# Embedding requires request_logger + chat_template + content_format (kw-only)
 embedding_server = OpenAIServingEmbedding(
     engine_client=engine,
     model_config=model_config,
     models=models,
     request_logger=None,
+    chat_template=CHAT_TEMPLATE,
+    chat_template_content_format=CHAT_TEMPLATE_FORMAT,
 )
 # -----------------------------
 # 5) RunPod job handler
