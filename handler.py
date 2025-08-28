@@ -264,7 +264,7 @@ engine = AsyncLLMEngine.from_engine_args(engine_args)
 # -----------------------------
 # 4) OpenAI-serving objects
 # -----------------------------
-model_config = ModelConfig(chat_template=None)
+model_config = ModelConfig()
 models = OpenAIServingModels(
     engine_client=engine,
     model_config=model_config,  # <- REQUIRED in 0.7.x
