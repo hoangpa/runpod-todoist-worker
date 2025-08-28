@@ -264,7 +264,19 @@ engine = AsyncLLMEngine.from_engine_args(engine_args)
 # -----------------------------
 # 4) OpenAI-serving objects
 # -----------------------------
-model_config = ModelConfig()
+# vLLM 0.7.3 wants explicit fields:
+# (model, task, tokenizer, tokenizer_mode, trust_remote_code, dtype, seed)
+SEED = int(os.environ.get("SEED", "0"))
+
+model_config = ModelConfig(
+    model=model_arg,                # e.g. "/runpod-volume/models/hoangpa--qwen2.5-32b-todoist-agent"
+    task="generate",                # Qwen supports multiple tasks; pick 'generate'
+    tokenizer=tokenizer_arg,        # e.g. "Qwen/Qwen2.5-32B-Instruct"
+    tokenizer_mode="auto",          # string is accepted in 0.7.x
+    trust_remote_code=TRUST_REMOTE_CODE,
+    dtype=DTYPE,                    # keep "auto" or your dtype choice
+    seed=SEED,
+)
 models = OpenAIServingModels(
     engine_client=engine,
     model_config=model_config,  # <- REQUIRED in 0.7.x
