@@ -291,9 +291,21 @@ chat_server = OpenAIServingChat(
     chat_template=None,                    # let tokenizer’s template resolve
     chat_template_content_format="auto",   # keyword-only; safe default
 )
-completion_server = OpenAIServingCompletion(engine, model_config, models)
-embedding_server = OpenAIServingEmbedding(engine, model_config, models)
+# Completion: add request_logger kw-only
+completion_server = OpenAIServingCompletion(
+    engine_client=engine,
+    model_config=model_config,
+    models=models,
+    request_logger=None,
+)
 
+# Embedding: add request_logger kw-only
+embedding_server = OpenAIServingEmbedding(
+    engine_client=engine,
+    model_config=model_config,
+    models=models,
+    request_logger=None,
+)
 # -----------------------------
 # 5) RunPod job handler
 # -----------------------------
