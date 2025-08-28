@@ -286,8 +286,10 @@ chat_server = OpenAIServingChat(
     engine_client=engine,
     model_config=model_config,
     models=models,
-    response_role="assistant",        # <-- REQUIRED in 0.7.x
-    # chat_template=None,             # optional; omit to use tokenizer’s default
+    response_role="assistant",             # REQUIRED in 0.7.x
+    request_logger=None,                   # REQUIRED keyword-only; pass None
+    chat_template=None,                    # let tokenizer’s template resolve
+    chat_template_content_format="auto",   # keyword-only; safe default
 )
 completion_server = OpenAIServingCompletion(engine, model_config, models)
 embedding_server = OpenAIServingEmbedding(engine, model_config, models)
