@@ -4,3 +4,4 @@ pyairports @ https://files.pythonhosted.org/packages/6e/75/b424aebc9f2fc5db319d5
 huggingface_hub[hf_transfer]>=0.23.0
 numpy<2
 pydantic>=2,<3
+runpod>=1.7.9

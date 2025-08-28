@@ -319,9 +319,31 @@ embedding_server = OpenAIServingEmbedding(
 # -----------------------------
 async def handler(job):
     try:
-        event = job.get("input", {}) if isinstance(job, dict) else {}
-        path = event.get("path", "")
-        body = event.get("body", {}) or {}
+        # Accept both {"input": {...}} and top-level {...} shapes from RunPod
+        if isinstance(job, dict):
+            event = job.get("input") or job
+        else:
+            event = {}
+
+        # Path can appear as "path" (HTTP Proxy) or occasionally "route"
+        path = event.get("path") or event.get("route") or ""
+
+        # Body may be a dict or a JSON string
+        raw_body = event.get("body", {})
+        if isinstance(raw_body, str):
+            try:
+                body = json.loads(raw_body)
+            except Exception:
+                body = {}
+        else:
+            body = dict(raw_body) if isinstance(raw_body, dict) else {}
+
+        print(f"[HTTP PROXY] path={path} method={event.get('method')}")  # temporary debug
+
+        # Sensible defaults
+        body.setdefault("model", SERVED_NAME)
+        if path.endswith("/v1/chat/completions") or path.endswith("/v1/completions"):
+            body.setdefault("stream", False)
 
         body = dict(body)
         body.setdefault("model", SERVED_NAME)
@@ -356,5 +378,5 @@ print("Starting RunPod serverless worker...")
 runpod.serverless.start({
     "handler": handler,
     # 32B is heavy—start conservatively; tune up later
-    "concurrency_modifier": lambda _: 16,
+    "concurrency_modifier": lambda _: 1,
 })
