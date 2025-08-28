@@ -282,7 +282,13 @@ models = OpenAIServingModels(
     model_config=model_config,  # <- REQUIRED in 0.7.x
     base_model_paths=[BaseModelPath(name=SERVED_NAME, model_path=model_arg)],  # <- include model_path
 )
-chat_server = OpenAIServingChat(engine, model_config, models)
+chat_server = OpenAIServingChat(
+    engine_client=engine,
+    model_config=model_config,
+    models=models,
+    response_role="assistant",        # <-- REQUIRED in 0.7.x
+    # chat_template=None,             # optional; omit to use tokenizer’s default
+)
 completion_server = OpenAIServingCompletion(engine, model_config, models)
 embedding_server = OpenAIServingEmbedding(engine, model_config, models)
 
